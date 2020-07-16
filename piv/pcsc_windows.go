@@ -50,7 +50,7 @@ func scCheck(rc uintptr) error {
 }
 
 func isRCNoReaders(rc uintptr) bool {
-	return rc == 0x8010002E
+	return C.ulong(rc) == 0x8010002E
 }
 
 type scContext struct {
