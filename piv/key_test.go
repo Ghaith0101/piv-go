@@ -78,6 +78,65 @@ func TestYubiKeySignECDSA(t *testing.T) {
 	}
 }
 
+func TestYubiKeyECDSASharedKey(t *testing.T) {
+	yk, close := newTestYubiKey(t)
+	defer close()
+
+	slot := SlotAuthentication
+
+	key := Key{
+		Algorithm:   AlgorithmEC256,
+		TouchPolicy: TouchPolicyNever,
+		PINPolicy:   PINPolicyNever,
+	}
+	pubKey, err := yk.GenerateKey(DefaultManagementKey, slot, key)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	pub, ok := pubKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Fatalf("public key is not an ecdsa key")
+	}
+	priv, err := yk.PrivateKey(slot, pub, KeyAuth{})
+	if err != nil {
+		t.Fatalf("getting private key: %v", err)
+	}
+	privECDSA, ok := priv.(*ECDSAPrivateKey)
+	if !ok {
+		t.Fatalf("expected private key to be ECDSA private key")
+	}
+
+	t.Run("good", func(t *testing.T) {
+		eph, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatalf("cannot generate key: %v", err)
+		}
+		mult, _ := pub.ScalarMult(pub.X, pub.Y, eph.D.Bytes())
+		secret1 := mult.Bytes()
+
+		secret2, err := privECDSA.SharedKey(&eph.PublicKey)
+		if err != nil {
+			t.Fatalf("key agreement failed: %v", err)
+		}
+		if !bytes.Equal(secret1, secret2) {
+			t.Errorf("key agreement didn't match")
+		}
+	})
+
+	t.Run("bad", func(t *testing.T) {
+		t.Run("size", func(t *testing.T) {
+			eph, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+			if err != nil {
+				t.Fatalf("cannot generate key: %v", err)
+			}
+			_, err = privECDSA.SharedKey(&eph.PublicKey)
+			if !errors.Is(err, errMismatchingAlgorithms) {
+				t.Fatalf("unexpected error value: wanted errMismatchingAlgorithms: %v", err)
+			}
+		})
+	})
+}
+
 func TestPINPrompt(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -577,5 +636,50 @@ func TestYubiKeyPrivateKeyPINError(t *testing.T) {
 	hash := b[:]
 	if _, err := signer.Sign(rand.Reader, hash, crypto.SHA256); err == nil {
 		t.Errorf("expected sign to fail with pin prompt that returned error")
+	}
+}
+
+func TestRetiredKeyManagementSlot(t *testing.T) {
+	tests := []struct {
+		name     string
+		key      uint32
+		wantSlot Slot
+		wantOk   bool
+	}{
+		{
+			name:     "Non-existent slot, before range",
+			key:      0x0,
+			wantSlot: Slot{},
+			wantOk:   false,
+		},
+		{
+			name:     "Non-existent slot, after range",
+			key:      0x96,
+			wantSlot: Slot{},
+			wantOk:   false,
+		},
+		{
+			name:     "First retired slot key",
+			key:      0x82,
+			wantSlot: Slot{0x82, 0x5fc10d},
+			wantOk:   true,
+		},
+		{
+			name:     "Last retired slot key",
+			key:      0x95,
+			wantSlot: Slot{0x95, 0x5fc120},
+			wantOk:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotSlot, gotOk := RetiredKeyManagementSlot(tt.key)
+			if gotSlot != tt.wantSlot {
+				t.Errorf("RetiredKeyManagementSlot() got = %v, want %v", gotSlot, tt.wantSlot)
+			}
+			if gotOk != tt.wantOk {
+				t.Errorf("RetiredKeyManagementSlot() got1 = %v, want %v", gotOk, tt.wantOk)
+			}
+		})
 	}
 }

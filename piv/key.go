@@ -31,6 +31,10 @@ import (
 	"math/big"
 )
 
+// errMismatchingAlgorithms is returned when a cryptographic operation
+// is given keys using different algorithms.
+var errMismatchingAlgorithms = errors.New("mismatching key algorithms")
+
 // Slot is a private key and certificate combination managed by the security key.
 type Slot struct {
 	// Key is a reference for a key type.
@@ -243,6 +247,44 @@ var (
 
 	slotAttestation = Slot{0xf9, 0x5fff01}
 )
+
+var retiredKeyManagementSlots = map[uint32]Slot{
+	0x82: {0x82, 0x5fc10d},
+	0x83: {0x83, 0x5fc10e},
+	0x84: {0x84, 0x5fc10f},
+	0x85: {0x85, 0x5fc110},
+	0x86: {0x86, 0x5fc111},
+	0x87: {0x87, 0x5fc112},
+	0x88: {0x88, 0x5fc113},
+	0x89: {0x89, 0x5fc114},
+	0x8a: {0x8a, 0x5fc115},
+	0x8b: {0x8b, 0x5fc116},
+	0x8c: {0x8c, 0x5fc117},
+	0x8d: {0x8d, 0x5fc118},
+	0x8e: {0x8e, 0x5fc119},
+	0x8f: {0x8f, 0x5fc11a},
+	0x90: {0x90, 0x5fc11b},
+	0x91: {0x91, 0x5fc11c},
+	0x92: {0x92, 0x5fc11d},
+	0x93: {0x93, 0x5fc11e},
+	0x94: {0x94, 0x5fc11f},
+	0x95: {0x95, 0x5fc120},
+}
+
+// RetiredKeyManagementSlot provides access to "retired" slots. Slots meant for old Key Management
+// keys that have been rotated. YubiKeys 4 and later support values between 0x82 and 0x95 (inclusive).
+//
+//     slot, ok := RetiredKeyManagementSlot(0x82)
+//     if !ok {
+//         // unrecognized slot
+//     }
+//     pub, err := yk.GenerateKey(managementKey, slot, key)
+//
+// https://developers.yubico.com/PIV/Introduction/Certificate_slots.html#_slot_82_95_retired_key_management
+func RetiredKeyManagementSlot(key uint32) (Slot, bool) {
+	slot, ok := retiredKeyManagementSlots[key]
+	return slot, ok
+}
 
 // Algorithm represents a specific algorithm and bit size supported by the PIV
 // specification.
@@ -657,7 +699,7 @@ func (yk *YubiKey) PrivateKey(slot Slot, public crypto.PublicKey, auth KeyAuth) 
 
 	switch pub := public.(type) {
 	case *ecdsa.PublicKey:
-		return &keyECDSA{yk, slot, pub, auth, pp}, nil
+		return &ECDSAPrivateKey{yk, slot, pub, auth, pp}, nil
 	case ed25519.PublicKey:
 		return &keyEd25519{yk, slot, pub, auth, pp}, nil
 	case *rsa.PublicKey:
@@ -667,7 +709,13 @@ func (yk *YubiKey) PrivateKey(slot Slot, public crypto.PublicKey, auth KeyAuth) 
 	}
 }
 
-type keyECDSA struct {
+// ECDSAPrivateKey is a crypto.PrivateKey implementation for ECDSA
+// keys. It implements crypto.Signer and the method SharedKey performs
+// Diffie-Hellman key agreements.
+//
+// Keys returned by YubiKey.PrivateKey() may be type asserted to
+// *ECDSAPrivateKey, if the slot contains an ECDSA key.
+type ECDSAPrivateKey struct {
 	yk   *YubiKey
 	slot Slot
 	pub  *ecdsa.PublicKey
@@ -675,13 +723,69 @@ type keyECDSA struct {
 	pp   PINPolicy
 }
 
-func (k *keyECDSA) Public() crypto.PublicKey {
+// Public returns the public key associated with this private key.
+func (k *ECDSAPrivateKey) Public() crypto.PublicKey {
 	return k.pub
 }
 
-func (k *keyECDSA) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+var _ crypto.Signer = (*ECDSAPrivateKey)(nil)
+
+// Sign implements crypto.Signer.
+func (k *ECDSAPrivateKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
 	return k.auth.do(k.yk, k.pp, func(tx *scTx) ([]byte, error) {
 		return ykSignECDSA(tx, k.slot, k.pub, digest)
+	})
+}
+
+// SharedKey performs a Diffie-Hellman key agreement with the peer
+// to produce a shared secret key.
+//
+// Peer's public key must use the same algorithm as the key in
+// this slot, or an error will be returned.
+//
+// Length of the result depends on the types and sizes of the keys
+// used for the operation. Callers should use a cryptographic key
+// derivation function to extract the amount of bytes they need.
+func (k *ECDSAPrivateKey) SharedKey(peer *ecdsa.PublicKey) ([]byte, error) {
+	if peer.Curve.Params().BitSize != k.pub.Curve.Params().BitSize {
+		return nil, errMismatchingAlgorithms
+	}
+	msg := elliptic.Marshal(peer.Curve, peer.X, peer.Y)
+	return k.auth.do(k.yk, k.pp, func(tx *scTx) ([]byte, error) {
+		var alg byte
+		size := k.pub.Params().BitSize
+		switch size {
+		case 256:
+			alg = algECCP256
+		case 384:
+			alg = algECCP384
+		default:
+			return nil, fmt.Errorf("unsupported curve: %d", size)
+		}
+
+		// https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-73-4.pdf#page=118
+		// https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-73-4.pdf#page=93
+		cmd := apdu{
+			instruction: insAuthenticate,
+			param1:      alg,
+			param2:      byte(k.slot.Key),
+			data: marshalASN1(0x7c,
+				append([]byte{0x82, 0x00},
+					marshalASN1(0x85, msg)...)),
+		}
+		resp, err := tx.Transmit(cmd)
+		if err != nil {
+			return nil, fmt.Errorf("command failed: %w", err)
+		}
+		sig, _, err := unmarshalASN1(resp, 1, 0x1c) // 0x7c
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal response: %v", err)
+		}
+		rs, _, err := unmarshalASN1(sig, 2, 0x02) // 0x82
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal response signature: %v", err)
+		}
+		return rs, nil
 	})
 }
 
