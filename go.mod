@@ -1,3 +1,3 @@
-module github.com/go-piv/piv-go
+module github.com/Ghaith0101/piv-go
 
 go 1.13
