@@ -14,17 +14,17 @@
 
 package piv
 
-import "C"
+import pcsc "github.com/gballet/go-libpcsclite"
 
 // Return codes for PCSC are different on different platforms (int vs. long).
 
-func scCheck(rc C.long) error {
+func scCheck(rc pcsc.ErrorCode) error {
 	if rc == rcSuccess {
 		return nil
 	}
 	return &scErr{int64(rc)}
 }
 
-func isRCNoReaders(rc C.long) bool {
-	return C.ulong(rc) == 0x8010002E
+func isRCNoReaders(rc pcsc.ErrorCode) bool {
+	return rc == pcsc.ErrSCardNoReadersAvailable
 }
